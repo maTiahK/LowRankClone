@@ -3,7 +3,7 @@
 
 debug: false
 deepspeed_config:
-  gradient_accumulation_steps: 16
+  gradient_accumulation_steps: auto
   gradient_clipping: 1.0
   offload_optimizer_device: none  # Change to "cpu" if OOM
   offload_param_device: none      # Change to "cpu" if OOM
