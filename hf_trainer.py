@@ -95,6 +95,8 @@ def train_model(
     # Load corresponding model cls
     if "llama" in raw_model_name.lower():
         from modeling.co_train_llama import CoTrainLM, CustomConfig, reinit_weight
+    elif "qwen3" in raw_model_name.lower():
+        from modeling.co_train_qwen3 import CoTrainLM, CustomConfig, reinit_weight
     elif "qwen" in raw_model_name.lower():
         from modeling.co_train_qwen import CoTrainLM, CustomConfig, reinit_weight
     else:
