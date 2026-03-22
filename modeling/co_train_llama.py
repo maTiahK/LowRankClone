@@ -715,7 +715,9 @@ def calculate_language_loss(lgts, labels, vocab_size):
 
 
 class CoTrainLM(LlamaForCausalLM):
-    _tied_weights_keys = ["lm_head.weight"]
+    # Remove _tied_weights_keys to avoid conflict with newer transformers
+    # We don't actually tie weights, we use zoom projections instead
+    
     def __init__(self, config: CustomConfig):
         super().__init__(config)
         self.model = Model(config)
