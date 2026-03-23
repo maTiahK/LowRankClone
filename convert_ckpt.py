@@ -7,6 +7,7 @@ import json
 from torch import nn
 from tools.assign_device_map import assign_device_map
 from tools import global_state
+from tools.model_config_compat import load_custom_config_compat, detect_model_family
 # from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 from transformers import AutoTokenizer
@@ -40,19 +41,22 @@ def convert(
     use_all_attn=False,
 ):  
     # Load model config and model
-    if "llama" in raw_model_name.lower():
+    model_family = detect_model_family(raw_model_name)
+    if model_family == "llama":
         from modeling.co_train_llama import CoTrainLM, CustomConfig, reinit_weight
         arch = "LlamaForCausalLM"
         model_type = "llama"
-    elif "qwen3" in raw_model_name.lower():
+    elif model_family == "qwen3":
         from modeling.co_train_qwen3 import CoTrainLM, CustomConfig, reinit_weight
         arch = "Qwen3ForCausalLM"
         model_type = "qwen3"
-    else:
+    elif model_family == "qwen2":
         from modeling.co_train_qwen import CoTrainLM, CustomConfig, reinit_weight
         arch = "Qwen2ForCausalLM"
         model_type = "qwen2"
-    config = CustomConfig.from_pretrained(raw_model_name)
+    else:
+        raise ValueError("Could not find corresponding teacher model")
+    config = load_custom_config_compat(CustomConfig, raw_model_name)
     config.set_custom_kwargs(
         target_hidden_size=target_hidden_size, 
         target_rms_norm_eps=target_rms_norm_eps,

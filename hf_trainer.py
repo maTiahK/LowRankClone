@@ -26,6 +26,7 @@ from data.get_any_tokenize_func import get_any_tokenize_func, get_any_data_colla
 from tools.global_state import hyper_params
 from tools import global_state
 from tools.assign_device_map import assign_device_map
+from tools.model_config_compat import load_custom_config_compat, detect_model_family
 from accelerate import Accelerator
 from datetime import datetime
 
@@ -93,11 +94,12 @@ def train_model(
     hyper_params["gradient_accumulation_steps"] = gradient_accumulation_steps
     hyper_params["aux_loss_scale_factor"] = aux_loss_scale_factor
     # Load corresponding model cls
-    if "llama" in raw_model_name.lower():
+    model_family = detect_model_family(raw_model_name)
+    if model_family == "llama":
         from modeling.co_train_llama import CoTrainLM, CustomConfig, reinit_weight
-    elif "qwen3" in raw_model_name.lower():
+    elif model_family == "qwen3":
         from modeling.co_train_qwen3 import CoTrainLM, CustomConfig, reinit_weight
-    elif "qwen" in raw_model_name.lower():
+    elif model_family == "qwen2":
         from modeling.co_train_qwen import CoTrainLM, CustomConfig, reinit_weight
     else:
         raise ValueError("Could not find corresponding teacher model")
@@ -145,7 +147,7 @@ def train_model(
         )
 
     # Load model config and model
-    config = CustomConfig.from_pretrained(raw_model_name)
+    config = load_custom_config_compat(CustomConfig, raw_model_name)
     config.set_custom_kwargs(
         target_hidden_size=target_hidden_size, 
         target_rms_norm_eps=target_rms_norm_eps,
@@ -199,7 +201,7 @@ def train_model(
 
     elif model_cls == "origin":
         config._attn_implementation = "flash_attention_2"
-        model = LlamaForCausalLM if "llama" in raw_model_name.lower() else Qwen2ForCausalLM
+        model = LlamaForCausalLM if model_family == "llama" else Qwen2ForCausalLM
         model = model.to(dtype=torch.bfloat16, device="cuda:0")  # TODO: adapt to multi-GPU training
         for n, p in model.named_parameters():
             assert p.dtype == torch.bfloat16
@@ -210,7 +212,7 @@ def train_model(
         config.hidden_size = config.target_hidden_size
         config.num_attention_heads //= 2
         config.num_key_value_heads //= 2  # try to approximate as much as possible
-        _cls = LlamaForCausalLM if "llama" in raw_model_name.lower() else Qwen2ForCausalLM
+        _cls = LlamaForCausalLM if model_family == "llama" else Qwen2ForCausalLM
         # TODO not sure if qwen can run, presumably yes
         teacher = _cls.from_pretrained(raw_model_name, torch_dtype=torch.bfloat16,
                                                    attn_implementation="flash_attention_2")
@@ -225,7 +227,7 @@ def train_model(
     elif model_cls == "tiny_bert":
         from modeling.tiny_bert_llama import TinyBertLlamaForCausalLM
         
-        _cls = LlamaForCausalLM if "llama" in raw_model_name.lower() else Qwen2ForCausalLM
+        _cls = LlamaForCausalLM if model_family == "llama" else Qwen2ForCausalLM
         # TODO not sure if qwen can run, presumably yes
         teacher = _cls.from_pretrained(
             raw_model_name, torch_dtype=torch.bfloat16,
