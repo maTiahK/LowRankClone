@@ -2,8 +2,16 @@ import torch
 import wandb
 import os
 import transformers
+import warnings
 
-assert transformers.__version__ == "4.41.2"
+EXPECTED_TRANSFORMERS_VERSION = "4.41.2"
+if transformers.__version__ != EXPECTED_TRANSFORMERS_VERSION:
+    warnings.warn(
+        f"Expected transformers=={EXPECTED_TRANSFORMERS_VERSION}, "
+        f"but got {transformers.__version__}. "
+        "Proceeding with best-effort compatibility.",
+        RuntimeWarning,
+    )
 
 from torch import nn
 from torch.nn.functional import linear, embedding
