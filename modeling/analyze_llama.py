@@ -12,6 +12,11 @@ from dataclasses import dataclass
 from tools.global_state import hyper_params, data_cls_reversed_dict
 from accelerate import Accelerator
 
+try:
+    from transformers.masking_utils import create_causal_mask
+except Exception:
+    create_causal_mask = None
+
 
 accelerator = Accelerator()
 activations = {}
@@ -27,7 +32,13 @@ class CustomConfig(LlamaConfig):
         pass
 
 
-class Attn(LlamaFlashAttention2):
+try:
+    _AnalyzeAttnBase = LlamaFlashAttention2
+except NameError:
+    _AnalyzeAttnBase = LlamaAttention
+
+
+class Attn(_AnalyzeAttnBase):
     def __init__(self, config: CustomConfig, layer_idx = None):
         super().__init__(config, layer_idx)
         self.config = config
@@ -85,6 +96,42 @@ class Model(LlamaModel):
         )
         self.post_init()
 
+    def _build_causal_mask_compat(self, attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions, position_ids):
+        if hasattr(self, "_update_causal_mask"):
+            return self._update_causal_mask(
+                attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions
+            )
+        if create_causal_mask is not None:
+            try:
+                return create_causal_mask(
+                    config=self.config,
+                    input_embeds=inputs_embeds,
+                    attention_mask=attention_mask,
+                    cache_position=cache_position,
+                    past_key_values=past_key_values,
+                    position_ids=position_ids,
+                )
+            except TypeError:
+                return create_causal_mask(
+                    config=self.config,
+                    input_embeds=inputs_embeds,
+                    attention_mask=attention_mask,
+                    cache_position=cache_position,
+                    past_key_values=past_key_values,
+                )
+        return attention_mask
+
+    def _build_position_embeddings_compat(self, hidden_states, position_ids):
+        if not hasattr(self, "rotary_emb"):
+            return None
+        try:
+            return self.rotary_emb(hidden_states, position_ids)
+        except TypeError:
+            try:
+                return self.rotary_emb(hidden_states, position_ids=position_ids)
+            except Exception:
+                return None
+
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -132,12 +179,18 @@ class Model(LlamaModel):
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
-        causal_mask = self._update_causal_mask(
-            attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions
+        causal_mask = self._build_causal_mask_compat(
+            attention_mask,
+            inputs_embeds,
+            cache_position,
+            past_key_values,
+            output_attentions,
+            position_ids,
         )
 
         # embed positions
         hidden_states = inputs_embeds
+        position_embeddings = self._build_position_embeddings_compat(hidden_states, position_ids)
 
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
@@ -167,9 +220,11 @@ class Model(LlamaModel):
                     attention_mask=causal_mask,
                     position_ids=position_ids,
                     past_key_value=past_key_values,
+                    past_key_values=past_key_values,
                     output_attentions=output_attentions,
                     use_cache=use_cache,
                     cache_position=cache_position,
+                    position_embeddings=position_embeddings,
                 )
 
             hidden_states = layer_outputs[0]

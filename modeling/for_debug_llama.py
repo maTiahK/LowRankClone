@@ -43,10 +43,15 @@ class DebugLayer(LlamaDecoderLayer):
         attention_mask=None,
         position_ids=None,
         past_key_value=None,
+        past_key_values=None,
         output_attentions=False,
         use_cache=False,
         cache_position=None,
+        position_embeddings=None,
     ):
+        if past_key_values is not None and past_key_value is None:
+            past_key_value = past_key_values
+
         if self.layer_idx == 0:
             print("bf layer 0")
             print(hidden_states.max(), hidden_states.min(), hidden_states.mean())
@@ -63,6 +68,7 @@ class DebugLayer(LlamaDecoderLayer):
             output_attentions=output_attentions,
             use_cache=use_cache,
             cache_position=cache_position,
+            position_embeddings=position_embeddings,
         )
 
         print("layer af attn", self.layer_idx)

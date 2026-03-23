@@ -20,7 +20,6 @@ from torch.nn.functional import linear, embedding
 # Import LlamaConfig explicitly (wildcard import doesn't export it in transformers 5.x)
 from transformers import LlamaConfig
 from transformers.models.llama.modeling_llama import (
-    LlamaFlashAttention2,
     LlamaMLP,
     LlamaDecoderLayer,
     LlamaModel,
@@ -28,6 +27,25 @@ from transformers.models.llama.modeling_llama import (
     apply_rotary_pos_emb,
     logger,
 )
+try:
+    from transformers.models.llama.modeling_llama import LlamaFlashAttention2 as _BaseLlamaAttention
+except Exception:
+    from transformers.models.llama.modeling_llama import LlamaAttention as _BaseLlamaAttention
+
+try:
+    from transformers.models.llama.modeling_llama import repeat_kv
+except Exception:
+    def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+        if n_rep == 1:
+            return hidden_states
+        batch, num_key_value_heads, slen, head_dim = hidden_states.shape
+        hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
+        return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+
+try:
+    from transformers.masking_utils import create_causal_mask
+except Exception:
+    create_causal_mask = None
 from torch.nn import CrossEntropyLoss
 import torch.nn.functional as F
 from transformers.modeling_outputs import CausalLMOutputWithPast, BaseModelOutputWithPast, ModelOutput
@@ -38,6 +56,61 @@ from accelerate import Accelerator
 
 
 accelerator = Accelerator()
+
+
+def _attn_forward_compat(
+    module,
+    hidden_states,
+    attention_mask=None,
+    position_ids=None,
+    past_key_value=None,
+    output_attentions=False,
+    use_cache=False,
+    cache_position=None,
+    position_embeddings=None,
+    **kwargs,
+):
+    try:
+        return module.forward(
+            hidden_states,
+            attention_mask,
+            position_ids,
+            past_key_value,
+            output_attentions,
+            use_cache,
+            cache_position,
+            **kwargs,
+        )
+    except TypeError:
+        forward_kwargs = {
+            "hidden_states": hidden_states,
+            "attention_mask": attention_mask,
+            "position_ids": position_ids,
+            "past_key_value": past_key_value,
+            "output_attentions": output_attentions,
+            "use_cache": use_cache,
+            "cache_position": cache_position,
+            **kwargs,
+        }
+        if position_embeddings is not None:
+            forward_kwargs["position_embeddings"] = position_embeddings
+        return module.forward(**forward_kwargs)
+
+
+def _apply_rope_compat(module, query_states, key_states, value_states, position_ids=None, position_embeddings=None):
+    if position_embeddings is None:
+        try:
+            cos, sin = module.rotary_emb(value_states, position_ids)
+        except TypeError:
+            cos, sin = module.rotary_emb(value_states, position_ids=position_ids)
+    else:
+        cos, sin = position_embeddings
+
+    try:
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+    except TypeError:
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+    return query_states, key_states, cos, sin
 
 
 class BigValueFirstLoss(nn.Module):
@@ -93,7 +166,7 @@ class CustomConfig(LlamaConfig):
         self.use_additional_align = kwargs.get("use_additional_align", False)
 
 
-class AttnWithNewStudentWeight(LlamaFlashAttention2):
+class AttnWithNewStudentWeight(_BaseLlamaAttention):
     def __init__(self, config: CustomConfig, layer_idx = None):
         super().__init__(config, layer_idx)
         self.config = config
@@ -102,7 +175,7 @@ class AttnWithNewStudentWeight(LlamaFlashAttention2):
         student_config.hidden_size = config.target_hidden_size
         student_config.num_attention_heads = config.num_attention_heads // 2
         student_config.num_key_value_heads = config.num_key_value_heads // 2
-        self.student_attn = LlamaFlashAttention2(student_config, layer_idx)
+        self.student_attn = _BaseLlamaAttention(student_config, layer_idx)
     
     def forward(
         self,
@@ -115,6 +188,7 @@ class AttnWithNewStudentWeight(LlamaFlashAttention2):
         output_attentions=False,
         use_cache=False,
         cache_position=None,
+        position_embeddings=None,
         **kwargs,
     ):
         output_attentions = self.config.use_attn_map
@@ -123,30 +197,34 @@ class AttnWithNewStudentWeight(LlamaFlashAttention2):
         assert attention_mask is None
         assert past_key_value is None
         
-        raw_out, raw_attn_map, _ = super().forward(
-            hidden_states,
-            attention_mask,
-            position_ids,
-            past_key_value,
-            output_attentions,
-            use_cache,
-            cache_position,
+        raw_out, raw_attn_map, _ = _attn_forward_compat(
+            self,
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_value,
+            output_attentions=output_attentions,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            position_embeddings=position_embeddings,
             **kwargs,
         )
-        compressed_hidden_states, attn_map, _ = self.student_attn.forward(
-            compressed_hidden_states,
-            attention_mask,
-            position_ids,
-            past_key_value,
-            output_attentions,
-            use_cache,
-            cache_position,
+        compressed_hidden_states, attn_map, _ = _attn_forward_compat(
+            self.student_attn,
+            hidden_states=compressed_hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_value,
+            output_attentions=output_attentions,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            position_embeddings=position_embeddings,
             **kwargs,
         )
         return raw_out, compressed_hidden_states, raw_attn_map, _, loss_dict
 
 
-class Attn(LlamaFlashAttention2):
+class Attn(_BaseLlamaAttention):
     def __init__(self, config: CustomConfig, layer_idx = None):
         super().__init__(config, layer_idx)
         self.config = config
@@ -168,6 +246,7 @@ class Attn(LlamaFlashAttention2):
         output_attentions=False,
         use_cache=False,
         cache_position=None,
+        position_embeddings=None,
         **kwargs,
     ):
         output_attentions = self.config.use_attn_map
@@ -176,26 +255,30 @@ class Attn(LlamaFlashAttention2):
         assert attention_mask is None
         assert past_key_value is None
         
-        raw_out, raw_attn_map, _ = super().forward(
-            hidden_states,
-            attention_mask,
-            position_ids,
-            past_key_value,
-            output_attentions,
-            use_cache,
-            cache_position,
+        raw_out, raw_attn_map, _ = _attn_forward_compat(
+            self,
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_value,
+            output_attentions=output_attentions,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            position_embeddings=position_embeddings,
             **kwargs,
         )
         # assert not torch.isnan(compressed_hidden_states).any(), f"NaN detected in model output in a"
         zoomed_hs = self.zoom_up(compressed_hidden_states)
-        out, attn_map, _ = super().forward(
-            zoomed_hs,
-            attention_mask,
-            position_ids,
-            past_key_value,
-            output_attentions,
-            use_cache,
-            cache_position,
+        out, attn_map, _ = _attn_forward_compat(
+            self,
+            hidden_states=zoomed_hs,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_value,
+            output_attentions=output_attentions,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            position_embeddings=position_embeddings,
             **kwargs,
         )
         compressed_hidden_states = self.zoom_down(out)
@@ -217,7 +300,7 @@ class Attn(LlamaFlashAttention2):
         self.o_proj.weight.data = (self.zoom_down.weight.data @ self.o_proj.weight.data).contiguous()
 
 
-class AllAttn(LlamaFlashAttention2):
+class AllAttn(_BaseLlamaAttention):
     def __init__(self, config: CustomConfig, layer_idx = None):
         super().__init__(config, layer_idx)
         self.config = config
@@ -233,21 +316,23 @@ class AllAttn(LlamaFlashAttention2):
     def part_forward(self, query_states, key_states, value_states, 
                      bsz, q_len, position_ids, 
                      attention_mask=None, past_key_value=None, cache_position=None,
-                     output_attentions=False):
+                     output_attentions=False, position_embeddings=None):
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
-        cos, sin = self.rotary_emb(value_states, position_ids)
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        query_states, key_states, cos, sin = _apply_rope_compat(
+            self,
+            query_states,
+            key_states,
+            value_states,
+            position_ids=position_ids,
+            position_embeddings=position_embeddings,
+        )
 
         if past_key_value is not None:
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
-
-        query_states = query_states.transpose(1, 2)
-        key_states = key_states.transpose(1, 2)
-        value_states = value_states.transpose(1, 2)
 
         dropout_rate = self.attention_dropout if self.training else 0.0
 
@@ -270,9 +355,25 @@ class AllAttn(LlamaFlashAttention2):
             key_states = key_states.to(target_dtype)
             value_states = value_states.to(target_dtype)
 
-        attn_output = self._flash_attention_forward(
-            query_states, key_states, value_states, attention_mask, q_len, dropout=dropout_rate
-        )
+        if hasattr(self, "_flash_attention_forward"):
+            q_flash = query_states.transpose(1, 2)
+            k_flash = key_states.transpose(1, 2)
+            v_flash = value_states.transpose(1, 2)
+            attn_output = self._flash_attention_forward(
+                q_flash, k_flash, v_flash, attention_mask, q_len, dropout=dropout_rate
+            )
+        else:
+            key_states = repeat_kv(key_states, self.num_key_value_groups)
+            value_states = repeat_kv(value_states, self.num_key_value_groups)
+            attn_output = F.scaled_dot_product_attention(
+                query_states,
+                key_states,
+                value_states,
+                attn_mask=attention_mask,
+                dropout_p=dropout_rate,
+                is_causal=attention_mask is None,
+            )
+            attn_output = attn_output.transpose(1, 2)
 
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size).contiguous()
         attn_output = self.o_proj(attn_output)
@@ -293,6 +394,7 @@ class AllAttn(LlamaFlashAttention2):
         output_attentions=False,
         use_cache=False,
         cache_position=None,
+        position_embeddings=None,
         **kwargs,
     ):
         assert past_key_value is None
@@ -309,9 +411,11 @@ class AllAttn(LlamaFlashAttention2):
         _up_hs_v = self.v_proj(self.zoom_v(compressed_hidden_states))
 
         raw_out, raw_attn_map, _ = self.part_forward(query_states, key_states, value_states, bsz, q_len, position_ids,
-                                                     attention_mask=None, cache_position=cache_position)
+                                 attention_mask=attention_mask, cache_position=cache_position,
+                                 position_embeddings=position_embeddings)
         out, attn_map, _ = self.part_forward(_up_hs_q, _up_hs_k, _up_hs_v, bsz, q_len, position_ids,
-                                             attention_mask=None, cache_position=cache_position)
+                             attention_mask=attention_mask, cache_position=cache_position,
+                             position_embeddings=position_embeddings)
         compressed_hidden_states = self.zoom_down(out)
 
         if "attn-q-sim-loss" not in ban_losses and self.layer_idx not in ban_layers:
@@ -494,10 +598,15 @@ class CustomLayer(LlamaDecoderLayer):
         attention_mask=None,
         position_ids=None,
         past_key_value=None,
+        past_key_values=None,
         output_attentions=False,
         use_cache=False,
         cache_position=None,
+        position_embeddings=None,
     ):
+        if past_key_values is not None and past_key_value is None:
+            past_key_value = past_key_values
+
         residual = hidden_states
         compressed_residual = compressed_hidden_states
 
@@ -517,6 +626,7 @@ class CustomLayer(LlamaDecoderLayer):
             output_attentions=output_attentions,
             use_cache=use_cache,
             cache_position=cache_position,
+            position_embeddings=position_embeddings,
         )
 
         hidden_states = residual + hidden_states
@@ -580,6 +690,42 @@ class Model(LlamaModel):
         self.embed_tokens.weight.data = self.zoom(self.embed_tokens.weight.data).contiguous()
         self.norm.weight.data = self.target_norm.weight.data
 
+    def _build_causal_mask_compat(self, attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions, position_ids):
+        if hasattr(self, "_update_causal_mask"):
+            return self._update_causal_mask(
+                attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions
+            )
+        if create_causal_mask is not None:
+            try:
+                return create_causal_mask(
+                    config=self.config,
+                    input_embeds=inputs_embeds,
+                    attention_mask=attention_mask,
+                    cache_position=cache_position,
+                    past_key_values=past_key_values,
+                    position_ids=position_ids,
+                )
+            except TypeError:
+                return create_causal_mask(
+                    config=self.config,
+                    input_embeds=inputs_embeds,
+                    attention_mask=attention_mask,
+                    cache_position=cache_position,
+                    past_key_values=past_key_values,
+                )
+        return attention_mask
+
+    def _build_position_embeddings_compat(self, hidden_states, position_ids):
+        if not hasattr(self, "rotary_emb"):
+            return None
+        try:
+            return self.rotary_emb(hidden_states, position_ids)
+        except TypeError:
+            try:
+                return self.rotary_emb(hidden_states, position_ids=position_ids)
+            except Exception:
+                return None
+
     def forward(
         self,
         input_ids=None,
@@ -619,8 +765,13 @@ class Model(LlamaModel):
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
-        causal_mask = self._update_causal_mask(
-            attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions
+        causal_mask = self._build_causal_mask_compat(
+            attention_mask,
+            inputs_embeds,
+            cache_position,
+            past_key_values,
+            output_attentions,
+            position_ids,
         )
 
         # embed positions
@@ -629,6 +780,7 @@ class Model(LlamaModel):
         if os.environ.get("DEBUG", False):
             print("emb token", Wemb[0, :6])
         compressed_hidden_states = embedding(input_ids, Wemb)
+        position_embeddings = self._build_position_embeddings_compat(hidden_states, position_ids)
         # assert not torch.isnan(compressed_hidden_states).any(), f"NaN detected in model output in af emb"
 
         # decoder layers
@@ -659,6 +811,7 @@ class Model(LlamaModel):
                     output_attentions=output_attentions,
                     use_cache=use_cache,
                     cache_position=cache_position,
+                    position_embeddings=position_embeddings,
                 )
 
                 compressed_hidden_states = layer_outputs[1]
