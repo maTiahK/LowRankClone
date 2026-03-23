@@ -71,8 +71,17 @@ def _attn_forward_compat(
     position_embeddings=None,
     **kwargs,
 ):
+    def _normalize_attn_out(out):
+        if not isinstance(out, (tuple, list)):
+            raise TypeError(f"Attention forward must return tuple/list, got {type(out)}")
+        if len(out) == 2:
+            return out[0], out[1], None
+        if len(out) == 3:
+            return out[0], out[1], out[2]
+        raise ValueError(f"Unexpected number of outputs from attention: {len(out)}")
+
     try:
-        return base_forward(
+        out = base_forward(
             module,
             hidden_states,
             attention_mask,
@@ -83,6 +92,7 @@ def _attn_forward_compat(
             cache_position,
             **kwargs,
         )
+        return _normalize_attn_out(out)
     except TypeError:
         forward_kwargs = {
             "hidden_states": hidden_states,
@@ -98,16 +108,19 @@ def _attn_forward_compat(
         if position_embeddings is not None:
             forward_kwargs["position_embeddings"] = position_embeddings
         try:
-            return base_forward(module, **forward_kwargs)
+            out = base_forward(module, **forward_kwargs)
+            return _normalize_attn_out(out)
         except TypeError:
             # Older versions may not accept past_key_values or position_embeddings.
             forward_kwargs.pop("past_key_values", None)
             if "position_embeddings" in forward_kwargs:
                 try:
-                    return base_forward(module, **forward_kwargs)
+                    out = base_forward(module, **forward_kwargs)
+                    return _normalize_attn_out(out)
                 except TypeError:
                     forward_kwargs.pop("position_embeddings", None)
-            return base_forward(module, **forward_kwargs)
+            out = base_forward(module, **forward_kwargs)
+            return _normalize_attn_out(out)
 
 
 def _apply_rope_compat(module, query_states, key_states, value_states, position_ids=None, position_embeddings=None):
