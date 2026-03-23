@@ -1,3 +1,4 @@
+from transformers import LlamaConfig
 from transformers.models.llama.modeling_llama import *
 
 

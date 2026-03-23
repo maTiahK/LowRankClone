@@ -4,6 +4,7 @@ import os
 
 from torch import nn
 from torch.nn.functional import linear, embedding
+from transformers import LlamaConfig
 from transformers.models.llama.modeling_llama import *
 from transformers.modeling_outputs import ModelOutput
 from tools.log import main_logger

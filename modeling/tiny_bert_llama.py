@@ -1,4 +1,5 @@
 import torch
+from transformers import LlamaConfig
 from transformers.models.llama.modeling_llama import *
 from tools.global_state import hyper_params, data_cls_reversed_dict
 from accelerate import Accelerator
