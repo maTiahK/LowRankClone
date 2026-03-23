@@ -132,6 +132,30 @@ class Model(LlamaModel):
             except Exception:
                 return None
 
+    def _decoder_layer_forward_compat(self, decoder_layer, hidden_states, causal_mask, position_ids, past_key_values, output_attentions, use_cache, cache_position, position_embeddings):
+        try:
+            return decoder_layer(
+                hidden_states,
+                attention_mask=causal_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_values,
+                past_key_values=past_key_values,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+                cache_position=cache_position,
+                position_embeddings=position_embeddings,
+            )
+        except TypeError:
+            return decoder_layer(
+                hidden_states,
+                attention_mask=causal_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_values,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+                cache_position=cache_position,
+            )
+
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -215,16 +239,16 @@ class Model(LlamaModel):
                     cache_position,
                 )
             else:
-                layer_outputs = decoder_layer(
+                layer_outputs = self._decoder_layer_forward_compat(
+                    decoder_layer,
                     hidden_states,
-                    attention_mask=causal_mask,
-                    position_ids=position_ids,
-                    past_key_value=past_key_values,
-                    past_key_values=past_key_values,
-                    output_attentions=output_attentions,
-                    use_cache=use_cache,
-                    cache_position=cache_position,
-                    position_embeddings=position_embeddings,
+                    causal_mask,
+                    position_ids,
+                    past_key_values,
+                    output_attentions,
+                    use_cache,
+                    cache_position,
+                    position_embeddings,
                 )
 
             hidden_states = layer_outputs[0]

@@ -60,6 +60,7 @@ accelerator = Accelerator()
 
 def _attn_forward_compat(
     module,
+    base_forward,
     hidden_states,
     attention_mask=None,
     position_ids=None,
@@ -71,7 +72,8 @@ def _attn_forward_compat(
     **kwargs,
 ):
     try:
-        return module.forward(
+        return base_forward(
+            module,
             hidden_states,
             attention_mask,
             position_ids,
@@ -87,6 +89,7 @@ def _attn_forward_compat(
             "attention_mask": attention_mask,
             "position_ids": position_ids,
             "past_key_value": past_key_value,
+            "past_key_values": past_key_value,
             "output_attentions": output_attentions,
             "use_cache": use_cache,
             "cache_position": cache_position,
@@ -94,7 +97,17 @@ def _attn_forward_compat(
         }
         if position_embeddings is not None:
             forward_kwargs["position_embeddings"] = position_embeddings
-        return module.forward(**forward_kwargs)
+        try:
+            return base_forward(module, **forward_kwargs)
+        except TypeError:
+            # Older versions may not accept past_key_values or position_embeddings.
+            forward_kwargs.pop("past_key_values", None)
+            if "position_embeddings" in forward_kwargs:
+                try:
+                    return base_forward(module, **forward_kwargs)
+                except TypeError:
+                    forward_kwargs.pop("position_embeddings", None)
+            return base_forward(module, **forward_kwargs)
 
 
 def _apply_rope_compat(module, query_states, key_states, value_states, position_ids=None, position_embeddings=None):
@@ -170,6 +183,7 @@ class AttnWithNewStudentWeight(_BaseLlamaAttention):
     def __init__(self, config: CustomConfig, layer_idx = None):
         super().__init__(config, layer_idx)
         self.config = config
+        self.hidden_size = config.hidden_size
         from copy import deepcopy
         student_config = deepcopy(self.config)
         student_config.hidden_size = config.target_hidden_size
@@ -199,6 +213,7 @@ class AttnWithNewStudentWeight(_BaseLlamaAttention):
         
         raw_out, raw_attn_map, _ = _attn_forward_compat(
             self,
+            _BaseLlamaAttention.forward,
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -211,6 +226,7 @@ class AttnWithNewStudentWeight(_BaseLlamaAttention):
         )
         compressed_hidden_states, attn_map, _ = _attn_forward_compat(
             self.student_attn,
+            _BaseLlamaAttention.forward,
             hidden_states=compressed_hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -228,6 +244,7 @@ class Attn(_BaseLlamaAttention):
     def __init__(self, config: CustomConfig, layer_idx = None):
         super().__init__(config, layer_idx)
         self.config = config
+        self.hidden_size = config.hidden_size
         self.zoom_up = nn.Linear(config.target_hidden_size, self.hidden_size, bias=False)
         self.zoom_down = nn.Linear(self.hidden_size, config.target_hidden_size, bias=False)
         if config.use_additional_align:
@@ -257,6 +274,7 @@ class Attn(_BaseLlamaAttention):
         
         raw_out, raw_attn_map, _ = _attn_forward_compat(
             self,
+            _BaseLlamaAttention.forward,
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -271,6 +289,7 @@ class Attn(_BaseLlamaAttention):
         zoomed_hs = self.zoom_up(compressed_hidden_states)
         out, attn_map, _ = _attn_forward_compat(
             self,
+            _BaseLlamaAttention.forward,
             hidden_states=zoomed_hs,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -304,6 +323,7 @@ class AllAttn(_BaseLlamaAttention):
     def __init__(self, config: CustomConfig, layer_idx = None):
         super().__init__(config, layer_idx)
         self.config = config
+        self.hidden_size = config.hidden_size
         self.zoom_q = nn.Linear(config.target_hidden_size, self.hidden_size, bias=False)
         self.zoom_k = nn.Linear(config.target_hidden_size, self.hidden_size, bias=False)
         self.zoom_v = nn.Linear(config.target_hidden_size, self.hidden_size, bias=False)
