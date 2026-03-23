@@ -3,6 +3,7 @@ import wandb
 import os
 import transformers
 import warnings
+from typing import Optional, Tuple
 
 EXPECTED_TRANSFORMERS_VERSION = "4.41.2"
 if transformers.__version__ != EXPECTED_TRANSFORMERS_VERSION:
@@ -15,17 +16,21 @@ if transformers.__version__ != EXPECTED_TRANSFORMERS_VERSION:
 
 from torch import nn
 from torch.nn.functional import linear, embedding
-# from transformers.models.llama.modeling_llama import (
-#     LlamaAttention, LlamaMLP,
-#     LlamaConfig, LlamaDecoderLayer,
-#     DebugLlamaRMSNorm, LlamaModel,
-#     LlamaForCausalLM,
-#     CrossEntropyLoss,
-#     CausalLMOutputWithPast,
-#     BaseModelOutputWithPast,
-# )
-from transformers.models.llama.modeling_llama import *
-from transformers.modeling_outputs import ModelOutput
+
+# Import LlamaConfig explicitly (wildcard import doesn't export it in transformers 5.x)
+from transformers import LlamaConfig
+from transformers.models.llama.modeling_llama import (
+    LlamaFlashAttention2,
+    LlamaMLP,
+    LlamaDecoderLayer,
+    LlamaModel,
+    LlamaForCausalLM,
+    apply_rotary_pos_emb,
+    logger,
+)
+from torch.nn import CrossEntropyLoss
+import torch.nn.functional as F
+from transformers.modeling_outputs import CausalLMOutputWithPast, BaseModelOutputWithPast, ModelOutput
 from tools.log import main_logger
 from dataclasses import dataclass
 from tools.global_state import hyper_params, data_cls_reversed_dict, ban_losses, ban_layers
