@@ -629,6 +629,16 @@ class CustomLayer(Gemma2DecoderLayer):
             self.mlp = MLP(config, layer_idx)
         self.target_input_layernorm = DebugLlamaRMSNorm(config.target_hidden_size, eps=config.target_rms_norm_eps)
         self.target_post_attention_layernorm = DebugLlamaRMSNorm(config.target_hidden_size, eps=config.target_rms_norm_eps)
+        # Gemma2 has additional FFN norms. Keep student-side counterparts so merged
+        # checkpoints can materialize target-width norm weights for inference.
+        if hasattr(self, "pre_feedforward_layernorm"):
+            self.target_pre_feedforward_layernorm = DebugLlamaRMSNorm(
+                config.target_hidden_size, eps=config.target_rms_norm_eps
+            )
+        if hasattr(self, "post_feedforward_layernorm"):
+            self.target_post_feedforward_layernorm = DebugLlamaRMSNorm(
+                config.target_hidden_size, eps=config.target_rms_norm_eps
+            )
 
     def forward(
         self,
@@ -678,7 +688,15 @@ class CustomLayer(Gemma2DecoderLayer):
         hidden_states = self.post_attention_layernorm(hidden_states)
         compressed_hidden_states = self.target_post_attention_layernorm(compressed_hidden_states)
 
+        if hasattr(self, "pre_feedforward_layernorm"):
+            hidden_states = self.pre_feedforward_layernorm(hidden_states)
+            compressed_hidden_states = self.target_pre_feedforward_layernorm(compressed_hidden_states)
+
         hidden_states, compressed_hidden_states, loss_dict = self.mlp(hidden_states, compressed_hidden_states, loss_dict)
+
+        if hasattr(self, "post_feedforward_layernorm"):
+            hidden_states = self.post_feedforward_layernorm(hidden_states)
+            compressed_hidden_states = self.target_post_feedforward_layernorm(compressed_hidden_states)
 
         hidden_states = residual + hidden_states
         compressed_hidden_states = compressed_hidden_states + compressed_residual
@@ -697,6 +715,10 @@ class CustomLayer(Gemma2DecoderLayer):
     def merge_weight(self):
         self.input_layernorm.weight.data = self.target_input_layernorm.weight.data
         self.post_attention_layernorm.weight.data = self.target_post_attention_layernorm.weight.data
+        if hasattr(self, "pre_feedforward_layernorm"):
+            self.pre_feedforward_layernorm.weight.data = self.target_pre_feedforward_layernorm.weight.data
+        if hasattr(self, "post_feedforward_layernorm"):
+            self.post_feedforward_layernorm.weight.data = self.target_post_feedforward_layernorm.weight.data
 
 
 @dataclass
