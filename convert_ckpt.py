@@ -110,6 +110,40 @@ def convert(
     # for n, p in state_dict.items():
     #     print(n, p.shape)
 
+    # Compatibility pass is Gemma2-only to avoid changing Llama/Qwen behavior.
+    if model_family == "gemma2":
+        model_state = model.state_dict()
+        transposed_keys = []
+        dropped_incompatible = []
+        for k, v in list(state_dict.items()):
+            tgt = model_state.get(k)
+            if tgt is None:
+                continue
+            if tuple(v.shape) == tuple(tgt.shape):
+                continue
+
+            if v.ndim == 2 and tuple(v.shape[::-1]) == tuple(tgt.shape):
+                state_dict[k] = v.t().contiguous()
+                transposed_keys.append((k, tuple(v.shape), tuple(state_dict[k].shape)))
+                continue
+
+            dropped_incompatible.append((k, tuple(v.shape), tuple(tgt.shape)))
+            del state_dict[k]
+
+        if transposed_keys:
+            print(f"[convert][gemma2] Auto-transposed {len(transposed_keys)} mismatched 2D tensors")
+            for k, src_shape, dst_shape in transposed_keys[:5]:
+                print(f"  - {k}: {src_shape} -> {dst_shape}")
+            if len(transposed_keys) > 5:
+                print(f"  ... and {len(transposed_keys) - 5} more")
+
+        if dropped_incompatible:
+            print(f"[convert][gemma2] Dropped {len(dropped_incompatible)} incompatible tensors")
+            for k, src_shape, tgt_shape in dropped_incompatible[:5]:
+                print(f"  - {k}: ckpt={src_shape}, model={tgt_shape}")
+            if len(dropped_incompatible) > 5:
+                print(f"  ... and {len(dropped_incompatible) - 5} more")
+
     missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
     assert len(unexpected_keys) == 0
 
