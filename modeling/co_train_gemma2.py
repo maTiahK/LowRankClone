@@ -335,6 +335,12 @@ class AllAttn(_BaseGemma2Attention):
         super().__init__(config, layer_idx)
         self.config = config
         self.hidden_size = config.hidden_size
+        # Keep attribute names stable across transformers versions.
+        self.num_heads = getattr(self, "num_heads", getattr(self, "num_attention_heads", config.num_attention_heads))
+        self.num_key_value_heads = getattr(self, "num_key_value_heads", config.num_key_value_heads)
+        self.num_key_value_groups = getattr(self, "num_key_value_groups", self.num_heads // self.num_key_value_heads)
+        self.head_dim = getattr(self, "head_dim", config.hidden_size // config.num_attention_heads)
+        self.attention_dropout = getattr(self, "attention_dropout", getattr(config, "attention_dropout", 0.0))
         self.zoom_q = nn.Linear(config.target_hidden_size, self.hidden_size, bias=False)
         self.zoom_k = nn.Linear(config.target_hidden_size, self.hidden_size, bias=False)
         self.zoom_v = nn.Linear(config.target_hidden_size, self.hidden_size, bias=False)
@@ -730,20 +736,29 @@ class Model(Gemma2Model):
             try:
                 return create_causal_mask(
                     config=self.config,
-                    input_embeds=inputs_embeds,
+                    inputs_embeds=inputs_embeds,
                     attention_mask=attention_mask,
                     cache_position=cache_position,
                     past_key_values=past_key_values,
                     position_ids=position_ids,
                 )
             except TypeError:
-                return create_causal_mask(
-                    config=self.config,
-                    input_embeds=inputs_embeds,
-                    attention_mask=attention_mask,
-                    cache_position=cache_position,
-                    past_key_values=past_key_values,
-                )
+                try:
+                    return create_causal_mask(
+                        config=self.config,
+                        input_embeds=inputs_embeds,
+                        attention_mask=attention_mask,
+                        cache_position=cache_position,
+                        past_key_values=past_key_values,
+                    )
+                except TypeError:
+                    return create_causal_mask(
+                        config=self.config,
+                        inputs_embeds=inputs_embeds,
+                        attention_mask=attention_mask,
+                        cache_position=cache_position,
+                        past_key_values=past_key_values,
+                    )
         return attention_mask
 
     def _build_position_embeddings_compat(self, hidden_states, position_ids):
