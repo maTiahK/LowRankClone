@@ -235,8 +235,25 @@ def convert(
     config_json_path = os.path.join(save_path, "config.json")
     config_json = json.load(open(config_json_path, "r"))
     
-    config_json["head_dim"] = config_json["hidden_size"] // config_json["num_attention_heads"]
-    config_json["hidden_size"] = config_json["target_hidden_size"]
+    # ========== GEMMA2 SPECIAL FIX ==========
+    # LowRankClone keeps teacher's attention architecture (num_heads, head_dim, intermediate_size)
+    # Only hidden_size changes to target_hidden_size
+    if model_family == "gemma2":
+        original_hidden = config.hidden_size
+        config_json["hidden_size"] = target_hidden_size
+        # Keep all attention parameters from teacher unchanged
+        # num_attention_heads, num_key_value_heads, head_dim, intermediate_size stay the same
+        print(f"[convert][gemma2] Student config:")
+        print(f"  hidden_size: {original_hidden} -> {target_hidden_size}")
+        print(f"  num_attention_heads: {config.num_attention_heads} (unchanged)")
+        print(f"  num_key_value_heads: {config.num_key_value_heads} (unchanged)")
+        print(f"  head_dim: {config.head_dim} (unchanged)")
+        print(f"  intermediate_size: {config.intermediate_size} (unchanged)")
+    else:
+        # Original logic for Llama/Qwen
+        config_json["head_dim"] = config_json["hidden_size"] // config_json["num_attention_heads"]
+        config_json["hidden_size"] = config_json["target_hidden_size"]
+    
     config_json["architectures"][0] = arch
     config_json["model_type"] = model_type
     config_json["tie_word_embeddings"] = True if tie_word_emb_proj else False
