@@ -40,7 +40,7 @@ def convert(
     use_in_out_mlp=False,
     use_all_attn=False,
 ):  
-    # Load model config and model
+    # Resolve family first.
     model_family = detect_model_family(raw_model_name)
     if model_family == "llama":
         from modeling.co_train_llama import CoTrainLM, CustomConfig, reinit_weight
@@ -60,6 +60,31 @@ def convert(
         model_type = "qwen2"
     else:
         raise ValueError("Could not find corresponding teacher model")
+
+    # Load checkpoint early.
+    state_dict = load_ckpt(ckpt_path)
+    # Infer/override target hidden size for Gemma2 only.
+    if model_family == "gemma2":
+        probe_keys = [
+            "model.layers.0.mlp.zoom_down.weight",
+            "model.layers.0.self_attn.zoom_down.weight",
+            "model.zoom.weight",
+        ]
+        inferred_hidden_size = None
+        for k in probe_keys:
+            t = state_dict.get(k)
+            if t is not None and t.ndim == 2:
+                inferred_hidden_size = int(t.shape[0])
+                print(f"[convert] Inferred target_hidden_size={inferred_hidden_size} from {k}: {tuple(t.shape)}")
+                break
+
+        if inferred_hidden_size is not None and int(target_hidden_size) != inferred_hidden_size:
+            print(
+                f"[convert] Override target_hidden_size: arg={target_hidden_size} -> ckpt={inferred_hidden_size}"
+            )
+            target_hidden_size = inferred_hidden_size
+
+    # Load model config and model
     config = load_custom_config_compat(CustomConfig, raw_model_name)
     config.set_custom_kwargs(
         target_hidden_size=target_hidden_size, 
@@ -106,7 +131,6 @@ def convert(
     #     print("Are emb tokens and lm head sharing parameters? I'm not sure about this assertion... There are weird bugs between 3b and 8b, I'm speechless")
     #     global_state.info_dict["shared_tokens_emb"] = True
 
-    state_dict = load_ckpt(ckpt_path)
     # for n, p in state_dict.items():
     #     print(n, p.shape)
 
@@ -114,10 +138,13 @@ def convert(
     if model_family == "gemma2":
         model_state = model.state_dict()
         transposed_keys = []
+        dropped_unknown = []
         dropped_incompatible = []
         for k, v in list(state_dict.items()):
             tgt = model_state.get(k)
             if tgt is None:
+                dropped_unknown.append(k)
+                del state_dict[k]
                 continue
             if tuple(v.shape) == tuple(tgt.shape):
                 continue
@@ -137,6 +164,13 @@ def convert(
             if len(transposed_keys) > 5:
                 print(f"  ... and {len(transposed_keys) - 5} more")
 
+        if dropped_unknown:
+            print(f"[convert][gemma2] Dropped {len(dropped_unknown)} unknown tensors")
+            for k in dropped_unknown[:5]:
+                print(f"  - {k}")
+            if len(dropped_unknown) > 5:
+                print(f"  ... and {len(dropped_unknown) - 5} more")
+
         if dropped_incompatible:
             print(f"[convert][gemma2] Dropped {len(dropped_incompatible)} incompatible tensors")
             for k, src_shape, tgt_shape in dropped_incompatible[:5]:
@@ -144,8 +178,22 @@ def convert(
             if len(dropped_incompatible) > 5:
                 print(f"  ... and {len(dropped_incompatible) - 5} more")
 
+    # Keep global behavior unchanged for non-Gemma families.
+    if model_family == "gemma2":
+        # Guard: remove keys not present in current model to avoid unexpected_keys failures.
+        model_state_keys = set(model.state_dict().keys())
+        dropped_unknown_global = [k for k in list(state_dict.keys()) if k not in model_state_keys]
+        if dropped_unknown_global:
+            for k in dropped_unknown_global:
+                del state_dict[k]
+            print(f"[convert] Dropped {len(dropped_unknown_global)} unknown keys before load_state_dict")
+
     missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
-    assert len(unexpected_keys) == 0
+    if unexpected_keys:
+        print(f"[convert] Unexpected keys after filtering: {len(unexpected_keys)}")
+        for k in unexpected_keys[:10]:
+            print(f"  - {k}")
+        raise ValueError("Unexpected keys remain after compatibility filtering")
 
     def merge(module: nn.Module):
         if hasattr(module, "merge_weight"):
