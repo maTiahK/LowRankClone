@@ -10,19 +10,21 @@ from torch.nn.functional import linear, embedding
 # Gemma2 support requires a transformers version that exposes modeling_gemma2.
 try:
     from transformers import Gemma2Config
+    from transformers.utils import logging
     from transformers.models.gemma2.modeling_gemma2 import (
         Gemma2MLP,
         Gemma2DecoderLayer,
         Gemma2Model,
         Gemma2ForCausalLM,
         apply_rotary_pos_emb,
-        logger,
     )
 except Exception as exc:
     raise ImportError(
         "Gemma2 backend requires transformers with Gemma2 classes "
         "(e.g. transformers >= 4.42)."
     ) from exc
+
+logger = logging.get_logger(__name__)
 try:
     from transformers.models.gemma2.modeling_gemma2 import Gemma2FlashAttention2 as _BaseGemma2Attention
 except Exception:
