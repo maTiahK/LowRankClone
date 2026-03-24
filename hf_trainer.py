@@ -18,7 +18,7 @@ torch.load = torch_wrapper
 NODE_CLASS_MAPPINGS = {}
 __all__ = ['NODE_CLASS_MAPPINGS']
 
-from transformers import AutoTokenizer, Trainer, TrainingArguments, LlamaForCausalLM, Qwen2ForCausalLM, set_seed
+from transformers import AutoTokenizer, AutoModelForCausalLM, Trainer, TrainingArguments, LlamaForCausalLM, Qwen2ForCausalLM, set_seed
 from datasets import load_from_disk, IterableDatasetDict
 from torch import nn
 from data.get_any_data import get_any_dataset
@@ -91,12 +91,25 @@ def train_model(
     use_accelerate=False,
     adam_beta2=0.999,
 ):  
+    def _resolve_teacher_cls(family):
+        if family == "llama":
+            return LlamaForCausalLM
+        if family == "qwen2":
+            return Qwen2ForCausalLM
+        if family == "qwen3":
+            return AutoModelForCausalLM
+        if family == "gemma2":
+            return AutoModelForCausalLM
+        raise ValueError(f"Unsupported model family for teacher loading: {family}")
+
     hyper_params["gradient_accumulation_steps"] = gradient_accumulation_steps
     hyper_params["aux_loss_scale_factor"] = aux_loss_scale_factor
     # Load corresponding model cls
     model_family = detect_model_family(raw_model_name)
     if model_family == "llama":
         from modeling.co_train_llama import CoTrainLM, CustomConfig, reinit_weight
+    elif model_family == "gemma2":
+        from modeling.co_train_gemma2 import CoTrainLM, CustomConfig, reinit_weight
     elif model_family == "qwen3":
         from modeling.co_train_qwen3 import CoTrainLM, CustomConfig, reinit_weight
     elif model_family == "qwen2":
@@ -201,7 +214,12 @@ def train_model(
 
     elif model_cls == "origin":
         config._attn_implementation = "flash_attention_2"
-        model = LlamaForCausalLM if model_family == "llama" else Qwen2ForCausalLM
+        _cls = _resolve_teacher_cls(model_family)
+        model = _cls.from_pretrained(
+            raw_model_name,
+            torch_dtype=torch.bfloat16,
+            attn_implementation="flash_attention_2",
+        )
         model = model.to(dtype=torch.bfloat16, device="cuda:0")  # TODO: adapt to multi-GPU training
         for n, p in model.named_parameters():
             assert p.dtype == torch.bfloat16
@@ -212,8 +230,7 @@ def train_model(
         config.hidden_size = config.target_hidden_size
         config.num_attention_heads //= 2
         config.num_key_value_heads //= 2  # try to approximate as much as possible
-        _cls = LlamaForCausalLM if model_family == "llama" else Qwen2ForCausalLM
-        # TODO not sure if qwen can run, presumably yes
+        _cls = _resolve_teacher_cls(model_family)
         teacher = _cls.from_pretrained(raw_model_name, torch_dtype=torch.bfloat16,
                                                    attn_implementation="flash_attention_2")
         teacher = accelerator.prepare_model(teacher)
@@ -227,8 +244,7 @@ def train_model(
     elif model_cls == "tiny_bert":
         from modeling.tiny_bert_llama import TinyBertLlamaForCausalLM
         
-        _cls = LlamaForCausalLM if model_family == "llama" else Qwen2ForCausalLM
-        # TODO not sure if qwen can run, presumably yes
+        _cls = _resolve_teacher_cls(model_family)
         teacher = _cls.from_pretrained(
             raw_model_name, torch_dtype=torch.bfloat16,
             # attn_implementation="flash_attention_2"

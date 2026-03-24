@@ -46,6 +46,10 @@ def convert(
         from modeling.co_train_llama import CoTrainLM, CustomConfig, reinit_weight
         arch = "LlamaForCausalLM"
         model_type = "llama"
+    elif model_family == "gemma2":
+        from modeling.co_train_gemma2 import CoTrainLM, CustomConfig, reinit_weight
+        arch = "Gemma2ForCausalLM"
+        model_type = "gemma2"
     elif model_family == "qwen3":
         from modeling.co_train_qwen3 import CoTrainLM, CustomConfig, reinit_weight
         arch = "Qwen3ForCausalLM"

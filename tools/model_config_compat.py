@@ -78,6 +78,8 @@ def detect_model_family(model_ref):
 
     if model_type == "llama" or "llamaforcausallm" in arch_text:
         return "llama"
+    if model_type == "gemma2" or "gemma2forcausallm" in arch_text:
+        return "gemma2"
     if model_type == "qwen3" or "qwen3forcausallm" in arch_text:
         return "qwen3"
     if model_type in ("qwen2", "qwen") or "qwen2forcausallm" in arch_text:
@@ -86,6 +88,8 @@ def detect_model_family(model_ref):
     ref = str(model_ref).lower()
     if "llama" in ref:
         return "llama"
+    if "gemma-2" in ref or "gemma2" in ref or "gemma" in ref:
+        return "gemma2"
     if "qwen3" in ref:
         return "qwen3"
     if "qwen" in ref:

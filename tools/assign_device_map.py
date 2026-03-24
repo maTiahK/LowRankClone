@@ -5,7 +5,7 @@ def assign_device_map(model_name: str, gpus=1, local_rank=None):
     elif gpus == 1:
         return f"cuda:{local_rank}"
     assert gpus == 2
-    if "llama" in model_name and "8b" in model_name:
+    if ("llama" in model_name and "8b" in model_name) or ("gemma" in model_name and ("9b" in model_name or "8b" in model_name)):
         return {
             "model.embed_tokens": 0,
             "model.zoom": 0,
