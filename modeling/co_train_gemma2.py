@@ -412,7 +412,9 @@ class AllAttn(_BaseGemma2Attention):
             )
             attn_output = attn_output.transpose(1, 2)
 
-        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size).contiguous()
+        # Gemma2 raw attention width is num_heads * head_dim and may differ from hidden_size.
+        # Let o_proj handle projection to hidden_size.
+        attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()
         attn_output = self.o_proj(attn_output)
 
         if not output_attentions:
