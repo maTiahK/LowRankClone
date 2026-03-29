@@ -392,25 +392,48 @@ class AllAttn(_BaseGemma2Attention):
             key_states = key_states.to(target_dtype)
             value_states = value_states.to(target_dtype)
 
+        # Gemma2 uses attn_logit_softcapping; must be applied in both flash and SDPA paths.
+        _softcap = getattr(self.config, "attn_logit_softcapping", None)
         if hasattr(self, "_flash_attention_forward"):
             q_flash = query_states.transpose(1, 2)
             k_flash = key_states.transpose(1, 2)
             v_flash = value_states.transpose(1, 2)
-            attn_output = self._flash_attention_forward(
-                q_flash, k_flash, v_flash, attention_mask, q_len, dropout=dropout_rate
-            )
+            _flash_kwargs = {}
+            if _softcap is not None:
+                _flash_kwargs["softcap"] = _softcap
+            try:
+                attn_output = self._flash_attention_forward(
+                    q_flash, k_flash, v_flash, attention_mask, q_len, dropout=dropout_rate, **_flash_kwargs
+                )
+            except TypeError:
+                # Older flash-attn versions may not accept softcap; fall back without it.
+                attn_output = self._flash_attention_forward(
+                    q_flash, k_flash, v_flash, attention_mask, q_len, dropout=dropout_rate
+                )
         else:
             key_states = repeat_kv(key_states, self.num_key_value_groups)
             value_states = repeat_kv(value_states, self.num_key_value_groups)
-            attn_output = F.scaled_dot_product_attention(
-                query_states,
-                key_states,
-                value_states,
-                attn_mask=attention_mask,
-                dropout_p=dropout_rate,
-                is_causal=attention_mask is None,
-            )
-            attn_output = attn_output.transpose(1, 2)
+            if _softcap is not None:
+                # F.scaled_dot_product_attention does not support softcapping; use manual attention.
+                _scale = getattr(self, "scaling", self.head_dim ** -0.5)
+                attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) * _scale
+                attn_weights = torch.tanh(attn_weights / _softcap) * _softcap
+                if attention_mask is not None:
+                    attn_weights = attn_weights + attention_mask
+                attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+                attn_weights = F.dropout(attn_weights, p=dropout_rate, training=self.training)
+                attn_output = torch.matmul(attn_weights, value_states)
+                attn_output = attn_output.transpose(1, 2)
+            else:
+                attn_output = F.scaled_dot_product_attention(
+                    query_states,
+                    key_states,
+                    value_states,
+                    attn_mask=attention_mask,
+                    dropout_p=dropout_rate,
+                    is_causal=attention_mask is None,
+                )
+                attn_output = attn_output.transpose(1, 2)
 
         # Gemma2 raw attention width is num_heads * head_dim and may differ from hidden_size.
         # Let o_proj handle projection to hidden_size.
@@ -868,34 +891,62 @@ class Model(Gemma2Model):
         
         loss_dict = None
         for layer_idx, decoder_layer in enumerate(self.layers):
-            if self.gradient_checkpointing and self.training:
-                raise NotImplementedError
-            
             if layer_idx not in self.config.del_layers:
-                layer_outputs = decoder_layer(
-                    hidden_states,
-                    compressed_hidden_states,
-                    attention_mask=causal_mask,
-                    position_ids=position_ids,
-                    past_key_value=past_key_values,
-                    output_attentions=output_attentions,
-                    use_cache=use_cache,
-                    cache_position=cache_position,
-                    position_embeddings=position_embeddings,
-                )
+                if self.gradient_checkpointing and self.training:
+                    def _ckpt_custom(hs, chs, _layer=decoder_layer):
+                        return _layer(
+                            hs, chs,
+                            attention_mask=causal_mask,
+                            position_ids=position_ids,
+                            past_key_value=None,
+                            output_attentions=output_attentions,
+                            use_cache=False,
+                            cache_position=cache_position,
+                            position_embeddings=position_embeddings,
+                        )
+                    layer_outputs = self._gradient_checkpointing_func(
+                        _ckpt_custom, hidden_states, compressed_hidden_states
+                    )
+                else:
+                    layer_outputs = decoder_layer(
+                        hidden_states,
+                        compressed_hidden_states,
+                        attention_mask=causal_mask,
+                        position_ids=position_ids,
+                        past_key_value=past_key_values,
+                        output_attentions=output_attentions,
+                        use_cache=use_cache,
+                        cache_position=cache_position,
+                        position_embeddings=position_embeddings,
+                    )
 
                 compressed_hidden_states = layer_outputs[1]
                 loss_dict = layer_outputs[2]
             else:
-                layer_outputs = decoder_layer(
-                    hidden_states,
-                    attention_mask=causal_mask,
-                    position_ids=position_ids,
-                    past_key_value=past_key_values,
-                    output_attentions=output_attentions,
-                    use_cache=use_cache,
-                    cache_position=cache_position,
-                )
+                if self.gradient_checkpointing and self.training:
+                    def _ckpt_deleted(hs, _layer=decoder_layer):
+                        return _layer(
+                            hs,
+                            attention_mask=causal_mask,
+                            position_ids=position_ids,
+                            past_key_value=None,
+                            output_attentions=output_attentions,
+                            use_cache=False,
+                            cache_position=cache_position,
+                        )
+                    layer_outputs = self._gradient_checkpointing_func(
+                        _ckpt_deleted, hidden_states
+                    )
+                else:
+                    layer_outputs = decoder_layer(
+                        hidden_states,
+                        attention_mask=causal_mask,
+                        position_ids=position_ids,
+                        past_key_value=past_key_values,
+                        output_attentions=output_attentions,
+                        use_cache=use_cache,
+                        cache_position=cache_position,
+                    )
             
             hidden_states = layer_outputs[0]
 

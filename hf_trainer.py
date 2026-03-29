@@ -297,7 +297,7 @@ def train_model(
         max_steps=max_steps,
         save_total_limit=10,
         bf16=True,  # use bfloat16 precision
-        # gradient_checkpointing=True,  # Disabled: custom Qwen3 model doesn't support it
+        gradient_checkpointing=True,
         dataloader_num_workers=8,
         dataloader_pin_memory=True,
         max_grad_norm=max_grad_norm,

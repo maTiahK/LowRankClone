@@ -831,34 +831,62 @@ class Model(LlamaModel):
         
         loss_dict = None
         for layer_idx, decoder_layer in enumerate(self.layers):
-            if self.gradient_checkpointing and self.training:
-                raise NotImplementedError
-            
             if layer_idx not in self.config.del_layers:
-                layer_outputs = decoder_layer(
-                    hidden_states,
-                    compressed_hidden_states,
-                    attention_mask=causal_mask,
-                    position_ids=position_ids,
-                    past_key_value=past_key_values,
-                    output_attentions=output_attentions,
-                    use_cache=use_cache,
-                    cache_position=cache_position,
-                    position_embeddings=position_embeddings,
-                )
+                if self.gradient_checkpointing and self.training:
+                    def _ckpt_custom(hs, chs, _layer=decoder_layer):
+                        return _layer(
+                            hs, chs,
+                            attention_mask=causal_mask,
+                            position_ids=position_ids,
+                            past_key_value=None,
+                            output_attentions=output_attentions,
+                            use_cache=False,
+                            cache_position=cache_position,
+                            position_embeddings=position_embeddings,
+                        )
+                    layer_outputs = self._gradient_checkpointing_func(
+                        _ckpt_custom, hidden_states, compressed_hidden_states
+                    )
+                else:
+                    layer_outputs = decoder_layer(
+                        hidden_states,
+                        compressed_hidden_states,
+                        attention_mask=causal_mask,
+                        position_ids=position_ids,
+                        past_key_value=past_key_values,
+                        output_attentions=output_attentions,
+                        use_cache=use_cache,
+                        cache_position=cache_position,
+                        position_embeddings=position_embeddings,
+                    )
 
                 compressed_hidden_states = layer_outputs[1]
                 loss_dict = layer_outputs[2]
             else:
-                layer_outputs = decoder_layer(
-                    hidden_states,
-                    attention_mask=causal_mask,
-                    position_ids=position_ids,
-                    past_key_value=past_key_values,
-                    output_attentions=output_attentions,
-                    use_cache=use_cache,
-                    cache_position=cache_position,
-                )
+                if self.gradient_checkpointing and self.training:
+                    def _ckpt_deleted(hs, _layer=decoder_layer):
+                        return _layer(
+                            hs,
+                            attention_mask=causal_mask,
+                            position_ids=position_ids,
+                            past_key_value=None,
+                            output_attentions=output_attentions,
+                            use_cache=False,
+                            cache_position=cache_position,
+                        )
+                    layer_outputs = self._gradient_checkpointing_func(
+                        _ckpt_deleted, hidden_states
+                    )
+                else:
+                    layer_outputs = decoder_layer(
+                        hidden_states,
+                        attention_mask=causal_mask,
+                        position_ids=position_ids,
+                        past_key_value=past_key_values,
+                        output_attentions=output_attentions,
+                        use_cache=use_cache,
+                        cache_position=cache_position,
+                    )
             
             hidden_states = layer_outputs[0]
 

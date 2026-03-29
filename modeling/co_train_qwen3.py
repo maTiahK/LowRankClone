@@ -148,21 +148,21 @@ class Attn(nn.Module):
         self.mseloss = LOSS_DICT[config.aux_loss_type]()
 
     def _compute_attention(self, query_states, key_states, value_states, attention_mask=None):
-        """Compute attention output using eager attention"""
+        """Compute attention output using F.scaled_dot_product_attention (flash-attention dispatcher)."""
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) * self.scaling
-        if attention_mask is not None:
-            causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
-            attn_weights = attn_weights + causal_mask
-
-        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        attn_weights = F.dropout(attn_weights, p=self.attention_dropout if self.training else 0.0, training=self.training)
-        attn_output = torch.matmul(attn_weights, value_states)
+        attn_output = F.scaled_dot_product_attention(
+            query_states,
+            key_states,
+            value_states,
+            attn_mask=attention_mask,
+            dropout_p=self.attention_dropout if self.training else 0.0,
+            is_causal=attention_mask is None,
+            scale=self.scaling,
+        )
         attn_output = attn_output.transpose(1, 2).contiguous()
-        
-        return attn_output, attn_weights
+        return attn_output, None
 
     def forward(
         self,
@@ -258,10 +258,13 @@ class AllAttn(Attn):
         # Get position embeddings
         cos, sin = position_embeddings
         
-        # Teacher forward
-        query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
-        key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        # Teacher forward — save raw projections before norm to reuse in loss (avoids redundant forward)
+        _raw_q = self.q_proj(hidden_states)
+        _raw_k = self.k_proj(hidden_states)
+        _raw_v = self.v_proj(hidden_states)
+        query_states = self.q_norm(_raw_q.view(hidden_shape)).transpose(1, 2)
+        key_states = self.k_norm(_raw_k.view(hidden_shape)).transpose(1, 2)
+        value_states = _raw_v.view(hidden_shape).transpose(1, 2)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
         
         raw_out, raw_attn_weights = self._compute_attention(query_states, key_states, value_states, attention_mask)
@@ -283,17 +286,13 @@ class AllAttn(Attn):
         out = self.o_proj(out)
         compressed_hidden_states = self.zoom_down(out)
         
-        # Compute auxiliary losses
-        teacher_q = self.q_proj(hidden_states)
-        teacher_k = self.k_proj(hidden_states)
-        teacher_v = self.v_proj(hidden_states)
-        
+        # Compute auxiliary losses (use saved raw projections — no extra forward pass)
         if "attn-q-sim-loss" not in ban_losses and self.layer_idx not in ban_layers:
-            loss_dict["attn-q-sim-loss"] = self.mseloss(_up_hs_q, teacher_q)
+            loss_dict["attn-q-sim-loss"] = self.mseloss(_up_hs_q, _raw_q)
         if "attn-k-sim-loss" not in ban_losses and self.layer_idx not in ban_layers:
-            loss_dict["attn-k-sim-loss"] = self.mseloss(_up_hs_k, teacher_k)
+            loss_dict["attn-k-sim-loss"] = self.mseloss(_up_hs_k, _raw_k)
         if "attn-v-sim-loss" not in ban_losses and self.layer_idx not in ban_layers:
-            loss_dict["attn-v-sim-loss"] = self.mseloss(_up_hs_v, teacher_v)
+            loss_dict["attn-v-sim-loss"] = self.mseloss(_up_hs_v, _raw_v)
         if "attn-out-sim-loss" not in ban_losses and self.layer_idx not in ban_layers:
             loss_dict["attn-out-sim-loss"] = self.mseloss(out, raw_out)
             
@@ -531,34 +530,62 @@ class Model(Qwen3Model):
         self.cur_step += 1
         
         for layer_idx, decoder_layer in enumerate(self.layers):
-            if self.gradient_checkpointing and self.training:
-                raise NotImplementedError
-            
             if layer_idx not in self.config.del_layers:
-                layer_outputs = decoder_layer(
-                    hidden_states,
-                    compressed_hidden_states,
-                    attention_mask=None,
-                    position_ids=position_ids,
-                    position_embeddings=position_embeddings,
-                    past_key_value=past_key_values,
-                    output_attentions=output_attentions,
-                    use_cache=use_cache,
-                    cache_position=cache_position,
-                )
+                if self.gradient_checkpointing and self.training:
+                    def _ckpt_custom(hs, chs, _layer=decoder_layer):
+                        return _layer(
+                            hs, chs,
+                            attention_mask=None,
+                            position_ids=position_ids,
+                            position_embeddings=position_embeddings,
+                            past_key_value=None,
+                            output_attentions=output_attentions,
+                            use_cache=False,
+                            cache_position=cache_position,
+                        )
+                    layer_outputs = self._gradient_checkpointing_func(
+                        _ckpt_custom, hidden_states, compressed_hidden_states
+                    )
+                else:
+                    layer_outputs = decoder_layer(
+                        hidden_states,
+                        compressed_hidden_states,
+                        attention_mask=None,
+                        position_ids=position_ids,
+                        position_embeddings=position_embeddings,
+                        past_key_value=past_key_values,
+                        output_attentions=output_attentions,
+                        use_cache=use_cache,
+                        cache_position=cache_position,
+                    )
 
                 compressed_hidden_states = layer_outputs[1]
                 loss_dict = layer_outputs[2]
             else:
-                layer_outputs = decoder_layer(
-                    hidden_states,
-                    attention_mask=None,
-                    position_ids=position_ids,
-                    position_embeddings=position_embeddings,
-                    past_key_value=past_key_values,
-                    output_attentions=output_attentions,
-                    use_cache=use_cache,
-                )
+                if self.gradient_checkpointing and self.training:
+                    def _ckpt_deleted(hs, _layer=decoder_layer):
+                        return _layer(
+                            hs,
+                            attention_mask=None,
+                            position_ids=position_ids,
+                            position_embeddings=position_embeddings,
+                            past_key_value=None,
+                            output_attentions=output_attentions,
+                            use_cache=False,
+                        )
+                    layer_outputs = self._gradient_checkpointing_func(
+                        _ckpt_deleted, hidden_states
+                    )
+                else:
+                    layer_outputs = decoder_layer(
+                        hidden_states,
+                        attention_mask=None,
+                        position_ids=position_ids,
+                        position_embeddings=position_embeddings,
+                        past_key_value=past_key_values,
+                        output_attentions=output_attentions,
+                        use_cache=use_cache,
+                    )
             
             hidden_states = layer_outputs[0]
 
