@@ -7,11 +7,32 @@ import os
 
 orig_torch_load = torch.load
 
-def torch_wrapper(*args, **kwargs):
-    print("[comfyui-unsafe-torch] I have unsafely patched `torch.load`.  The `weights_only` option of `torch.load` is forcibly disabled.")
-    kwargs['weights_only'] = False
 
-    return orig_torch_load(*args, **kwargs)
+def _allow_unsafe_torch_load():
+    flag = str(os.environ.get("LRC_ALLOW_UNSAFE_TORCH_LOAD", "0")).strip().lower()
+    return flag in {"1", "true", "yes", "y"}
+
+
+def torch_wrapper(*args, **kwargs):
+    allow_unsafe = _allow_unsafe_torch_load()
+    requested = kwargs.get("weights_only")
+
+    if requested is None:
+        kwargs["weights_only"] = not allow_unsafe
+    elif requested is False and not allow_unsafe:
+        print(
+            "[security] Blocked torch.load(weights_only=False). "
+            "Set LRC_ALLOW_UNSAFE_TORCH_LOAD=1 if you trust the checkpoint source."
+        )
+        kwargs["weights_only"] = True
+
+    try:
+        return orig_torch_load(*args, **kwargs)
+    except TypeError as exc:
+        if "weights_only" in str(exc):
+            kwargs.pop("weights_only", None)
+            return orig_torch_load(*args, **kwargs)
+        raise
 
 torch.load = torch_wrapper
 

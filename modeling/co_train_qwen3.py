@@ -347,6 +347,40 @@ class MLP(Qwen3MLP):
         self.down_proj.weight.data = self.zoom_down(self.down_proj.weight.data.T).T.contiguous()
 
 
+class OnlyInOutMLP(Qwen3MLP):
+    def __init__(self, config: CustomConfig, layer_idx=None):
+        super().__init__(config)
+        self.zoom_up = nn.Linear(config.target_hidden_size, self.hidden_size, bias=False)
+        self.zoom_down = nn.Linear(self.hidden_size, config.target_hidden_size, bias=False)
+        self.mseloss = LOSS_DICT[config.aux_loss_type]()
+        self.layer_idx = layer_idx
+
+    def small_forward(self, compressed_x, raw_gate, raw_act_gate, raw_up, raw_x, raw_out, loss_dict: dict):
+        _x = self.zoom_up(compressed_x)
+        _t_out = self.down_proj(self.act_fn(self.gate_proj(_x)) * self.up_proj(_x))
+        _out = self.zoom_down(_t_out)
+
+        if "mlp-in-loss" not in ban_losses and self.layer_idx not in ban_layers:
+            loss_dict["mlp-in-loss"] = self.mseloss(_x, raw_x)
+        if "mlp-out-loss" not in ban_losses and self.layer_idx not in ban_layers:
+            loss_dict["mlp-out-loss"] = self.mseloss(_t_out, raw_out)
+
+        return _out
+
+    def forward(self, x, compressed_x, loss_dict: dict):
+        gate = self.gate_proj(x)
+        act_gate = self.act_fn(gate)
+        up = self.up_proj(x)
+        down = self.down_proj(act_gate * up)
+
+        return down, self.small_forward(compressed_x, gate, act_gate, up, x, down, loss_dict), loss_dict
+
+    def merge_weight(self):
+        self.gate_proj.weight.data = torch.matmul(self.gate_proj.weight.data, self.zoom_up.weight.data).contiguous()
+        self.up_proj.weight.data = torch.matmul(self.up_proj.weight.data, self.zoom_up.weight.data).contiguous()
+        self.down_proj.weight.data = torch.matmul(self.zoom_down.weight.data, self.down_proj.weight.data).contiguous()
+
+
 class CustomLayer(nn.Module):
     def __init__(self, config: CustomConfig, layer_idx):
         super().__init__()
@@ -361,7 +395,10 @@ class CustomLayer(nn.Module):
             self.self_attn = Attn(config, layer_idx)
         
         # Create MLP module
-        self.mlp = MLP(config, layer_idx)
+        if self.config.use_in_out_mlp:
+            self.mlp = OnlyInOutMLP(config, layer_idx)
+        else:
+            self.mlp = MLP(config, layer_idx)
         
         # Teacher layer norms
         self.input_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
